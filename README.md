@@ -1,45 +1,45 @@
-# Session watcher for Claude Code
+# Session watcher для Claude Code
 
-Claude Code sessions often end without a hand-over: you close the tab, go to lunch,
-switch tasks, and the context lives on only in a transcript nobody reads.
-Session watcher notices such sessions and takes a short, dense **context dump**
-of each one: goal, what was done, where it stopped, decisions, next step, key files.
-The next session (yours or the model's) can pick up from there.
+Сессии Claude Code часто заканчиваются без передачи дел. Вкладку закрыли, ушли на обед,
+переключились на другую задачу, и контекст остался только в транскрипте, который никто
+не читает. Session watcher замечает такие сессии и снимает с каждой короткий ёмкий
+**дамп контекста**: цель, что сделано, где остановились, решения, следующий шаг, ключевые
+файлы. Следующая сессия (ваша или модели) продолжит с этого места.
 
-- **Automatic.** A `SessionStart` hook starts a small background watcher per session.
-- **Cheap.** The transcript is shrunk locally to a digest of at most ~18k characters.
-  One `claude -p` call on Haiku then turns it into the dump, with no tools, no MCP,
-  no settings and a short system prompt. That costs about **$0.002–0.005** and
-  3–9k input tokens per dump.
-- **Respects your own rituals.** Commands you name (say `/handoff` or `/mv-close`)
-  take the session off watch, and any dump already taken for it is removed.
-- **Findable.** Dumps are plain Markdown with an `INDEX.md` per project. A new session
-  in the same project gets one line pointing at the latest dump. That costs about 60 tokens,
-  and the model reads the dump only if you ask it to continue.
-- **No dependencies.** It is a single Python 3.7+ file and uses the `claude` CLI you
-  already have, with your usual login.
+- **Автоматически.** Хук `SessionStart` запускает на каждую сессию небольшой фоновый наблюдатель.
+- **Дёшево.** Транскрипт сжимается локально в дайджест до ~18 тыс. символов. Затем один вызов
+  `claude -p` на Haiku превращает его в дамп: без инструментов, без MCP, без настроек
+  и с коротким системным промптом. Один дамп стоит примерно **$0.002–0.005**
+  и 3–9 тыс. входных токенов.
+- **Не мешает вашим ритуалам.** Команды, которые вы укажете (например `/handoff`
+  или `/mv-close`), снимают сессию с наблюдения, а уже снятый дамп удаляется.
+- **Легко найти.** Дампы — обычный Markdown, у каждого проекта свой `INDEX.md`. Новая сессия
+  в том же проекте получает одну строку со ссылкой на последний дамп. Это около 60 токенов,
+  а сам дамп модель читает, только если попросить продолжить работу.
+- **Без зависимостей.** Это один файл на Python 3.7+. Он использует уже установленный
+  `claude` и ваш обычный вход.
 
-## How it works
+## Как это работает
 
 ```
-SessionStart hook ──► watcher (detached, one per session)
-                        │ reads new transcript lines every minute
-                        ├─ excluded command seen ─► stop, delete its dump
-                        ├─ SDK / `claude -p` session ─► stop
-                        └─ transcript idle ≥ 50 min
-                              ├─ digest (local): turns, replies, edits, commits, todos
-                              ├─ claude -p --model haiku --tools "" ...  ─► dump
-                              └─ ~/.claude/session-dumps/<project>/<date>_<id>.md + INDEX.md
+хук SessionStart ──► наблюдатель (отдельный процесс, один на сессию)
+                       │ раз в минуту читает новые строки транскрипта
+                       ├─ встретилась исключённая команда ─► стоп, его дамп удаляется
+                       ├─ SDK-сессия / `claude -p` ─► стоп
+                       └─ транскрипт не менялся ≥ 50 мин
+                             ├─ дайджест (локально): реплики, ответы, правки, коммиты, todo
+                             ├─ claude -p --model haiku --tools "" ...  ─► дамп
+                             └─ ~/.claude/session-dumps/<проект>/<дата>_<id>.md + INDEX.md
 ```
 
-If the session continues after a dump, the dump is refreshed after the next idle
-period. After 12 h of idleness the watcher exits. Resuming the session
-(`claude --resume`) starts a new watcher.
+Если после дампа сессия продолжилась, после следующего простоя дамп обновится.
+После 12 часов простоя наблюдатель завершается. Возобновление сессии
+(`claude --resume`) запускает новый наблюдатель.
 
-A dump looks like this:
+Дамп выглядит так:
 
 ```markdown
-# Fix CSV parser crash on quoted newlines
+# Исправить падение CSV-парсера на переводах строк в кавычках
 
 - Session: `3f2a…` (resume: `claude --resume 3f2a…`)
 - Project: `/work/app`, branch: `fix/csv`, cwd: `/work/app`
@@ -55,92 +55,94 @@ A dump looks like this:
 ## Working tree at dump time
 ```
 
-## Install
+Заголовки разделов всегда на английском, а текст — на языке сессии (см. `language`).
+
+## Установка
 
 ```bash
 git clone https://github.com/GoodJaa/Session-watcher-agent.git
 cd Session-watcher-agent
-python3 install.py                 # every project: hook goes to ~/.claude/settings.json
+python3 install.py                 # все проекты: хук попадёт в ~/.claude/settings.json
 ```
 
-Common variants:
+Частые варианты:
 
 ```bash
-python3 install.py --exclude handoff --exclude mv-     # these commands end watching
-python3 install.py --dumps project                     # dumps in <project>/.claude/session-dumps/
-python3 install.py --settings ~/work/app/.claude/settings.local.json   # one project only
-python3 install.py --uninstall                         # remove the hook, keep dumps
+python3 install.py --exclude handoff --exclude mv-     # эти команды снимают сессию с наблюдения
+python3 install.py --dumps project                     # дампы в <проект>/.claude/session-dumps/
+python3 install.py --settings ~/work/app/.claude/settings.local.json   # только один проект
+python3 install.py --uninstall                         # убрать хук, дампы остаются
 ```
 
-The installer copies `session_watcher.py` to `~/.claude/session-watcher/` and creates
-`config.json` there. It backs up the settings file before adding the hook, and running
-it again replaces the hook instead of adding a second one. Only sessions started after
-installation are watched. If you run with `CLAUDE_CONFIG_DIR`, everything goes there
-instead of `~/.claude`.
+Установщик копирует `session_watcher.py` в `~/.claude/session-watcher/` и создаёт там
+`config.json`. Перед добавлением хука он делает резервную копию файла настроек, а повторный
+запуск заменяет хук, а не добавляет второй. Наблюдаются только сессии, запущенные после
+установки. Если Claude Code работает с `CLAUDE_CONFIG_DIR`, всё ставится туда вместо `~/.claude`.
 
-## Configuration
+## Настройка
 
-`~/.claude/session-watcher/config.json`. Every key is optional and can also be set as an
-environment variable `SESSION_WATCHER_<KEY>`, for example `SESSION_WATCHER_IDLE_MINUTES=30`.
+Файл `~/.claude/session-watcher/config.json`. Все ключи необязательны. Любой из них можно
+задать и переменной окружения `SESSION_WATCHER_<КЛЮЧ>`, например `SESSION_WATCHER_IDLE_MINUTES=30`.
 
-| Key | Default | Meaning |
+| Ключ | По умолчанию | Назначение |
 |---|---|---|
-| `idle_minutes` | `50` | Inactivity before a dump |
-| `model` | `haiku` | Model for the dump (`--model` value) |
-| `exclude_commands` | `[]` | Name prefixes of slash commands or skills that take a session off watch (`"mv-"` covers `/mv-close`, `/mv-resume`, `Skill mv-note`, `/plugin:mv-close`) |
-| `dumps_dir` | `~/.claude/session-dumps` | Root for dumps, one folder per project; `"project"` writes to `<project>/.claude/session-dumps/` and adds it to `.git/info/exclude` |
-| `announce` | `true` | Tell a new session in the project about the latest dump |
-| `announce_days` | `7` | Only announce dumps newer than this |
-| `language` | `auto` | Language of the dump; `auto` follows the session |
-| `max_words` | `350` | Upper bound on dump length |
-| `max_digest_chars` | `18000` | Upper bound on what goes into the model |
-| `keep_days` | `60` | Older dumps are deleted |
-| `projects` | `[]` | Only watch sessions under these directories (empty means all) |
-| `skip_entrypoints` | `sdk-cli`, `sdk-ts`, `sdk-py`, `sdk` | Non-interactive sessions that are never watched |
-| `give_up_hours` | `12` | Watcher exits after this much idleness |
-| `claude_bin` | auto | Path to `claude`, if auto-detection fails |
+| `idle_minutes` | `50` | Сколько минут простоя до дампа |
+| `model` | `haiku` | Модель для дампа (значение `--model`) |
+| `exclude_commands` | `[]` | Префиксы имён slash-команд и skill, которые снимают сессию с наблюдения (`"mv-"` покрывает `/mv-close`, `/mv-resume`, `Skill mv-note`, `/plugin:mv-close`) |
+| `dumps_dir` | `~/.claude/session-dumps` | Корень для дампов, по папке на проект; `"project"` пишет в `<проект>/.claude/session-dumps/` и добавляет его в `.git/info/exclude` |
+| `announce` | `true` | Сообщать новой сессии проекта о последнем дампе |
+| `announce_days` | `7` | Сообщать только о дампах не старше этого числа дней |
+| `language` | `auto` | Язык дампа; `auto` — язык сессии |
+| `max_words` | `350` | Предел длины дампа |
+| `max_digest_chars` | `18000` | Предел того, что уходит в модель |
+| `keep_days` | `60` | Более старые дампы удаляются |
+| `projects` | `[]` | Наблюдать только сессии в этих каталогах (пусто — все) |
+| `skip_entrypoints` | `sdk-cli`, `sdk-ts`, `sdk-py`, `sdk` | Неинтерактивные сессии, которые никогда не наблюдаются |
+| `give_up_hours` | `12` | Через столько часов простоя наблюдатель завершается |
+| `claude_bin` | авто | Путь к `claude`, если автопоиск не справился |
 
-The `claude` binary is found as the process that runs the hook, then on `PATH`,
-then in `~/.local/bin` and `~/.claude/local`, then in the VS Code, Cursor or Windsurf extension folders.
+`claude` ищется в таком порядке: процесс, запустивший хук, затем `PATH`, затем
+`~/.local/bin` и `~/.claude/local`, затем каталоги расширений VS Code, Cursor и Windsurf.
 
-## Commands
+## Команды
 
 ```bash
 W=~/.claude/session-watcher/session_watcher.py
-python3 $W status                              # watched sessions and their state
-python3 $W dump --transcript <file.jsonl>      # dump a session now
-python3 $W dump --transcript <file.jsonl> --dry-run   # only print the digest that would be sent
-tail ~/.claude/session-watcher/watch.log       # what happened, with token usage per dump
+python3 $W status                              # наблюдаемые сессии и их состояние
+python3 $W dump --transcript <файл.jsonl>      # снять дамп сессии сейчас
+python3 $W dump --transcript <файл.jsonl> --dry-run   # только показать дайджест, который ушёл бы в модель
+tail ~/.claude/session-watcher/watch.log       # что происходило, с расходом токенов на каждый дамп
 ```
 
-Transcripts live in `~/.claude/projects/<project-slug>/<session-id>.jsonl`.
+Транскрипты лежат в `~/.claude/projects/<slug-проекта>/<id-сессии>.jsonl`.
 
-## Privacy and cost
+## Приватность и расход
 
-Each dump sends a digest of the transcript to the model through your own `claude` login.
-This is the provider the session already talked to. Nothing goes anywhere else.
-The digest leaves out tool output, thinking and system reminders. It keeps your messages,
-the assistant's replies and short lines for actions, such as file paths, command
-descriptions, commit markers and the todo list. The log records tokens and cost for every dump.
+Каждый дамп отправляет дайджест транскрипта в модель через ваш собственный вход в `claude`.
+Это тот же провайдер, с которым уже работала сессия, больше данные никуда не уходят.
+В дайджест не попадают вывод инструментов, размышления модели и системные напоминания.
+В нём остаются ваши сообщения, ответы ассистента и короткие строки о действиях: пути
+к файлам, описания команд, отметки коммитов, todo-список. Токены и стоимость каждого
+дампа пишутся в лог.
 
-## Limitations
+## Ограничения
 
-- Linux and macOS only, because it relies on `fcntl` and detached processes. On Windows,
-  use WSL.
-- Idleness is measured by the transcript's modification time. A single command that runs
-  silently for more than `idle_minutes` counts as idle.
-- Sessions that are already running when you install are not watched. Their next start or
-  resume is.
+- Только Linux и macOS, потому что используются `fcntl` и отсоединённые процессы.
+  На Windows — через WSL.
+- Простой считается по времени изменения транскрипта. Одна команда, которая молча
+  работает дольше `idle_minutes`, сойдёт за простой.
+- Сессии, уже запущенные к моменту установки, не наблюдаются. Наблюдение начнётся
+  при их следующем запуске или возобновлении.
 
-## Tests
+## Тесты
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-The tests run on synthetic transcripts with a fake `claude` binary, so they need no
-network and spend no tokens.
+Тесты идут на синтетических транскриптах с фейковым `claude`: сеть не нужна,
+токены не тратятся.
 
-## License
+## Лицензия
 
 MIT
