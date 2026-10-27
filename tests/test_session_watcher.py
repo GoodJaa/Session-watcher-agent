@@ -231,10 +231,21 @@ class Dump(unittest.TestCase):
     def test_no_user_turns_no_dump(self):
         self.assertIsNone(sw.make_dump(write_transcript("cccc3333-empty", [assistant(text("hi"))])))
 
+    @unittest.skipIf(WINDOWS, "symlinks need extra rights on Windows")
+    def test_project_through_a_symlink_is_the_same_project(self):
+        link = os.path.join(TMP, "project-link")
+        if not os.path.islink(link):
+            os.symlink(PROJECT, link)
+        recs = [dict(r, cwd=link) for r in BASIC]
+        path = sw.make_dump(write_transcript("eeee9999-link", recs))
+        with mock.patch.object(sw.os, "getcwd", return_value=os.path.realpath(PROJECT)):
+            self.assertIn("eeee9999-link", sw.cmd_list(False))
+        self.assertEqual(sw.read_dump(path)[0]["project"], os.path.realpath(PROJECT))
+
     def test_project_mode_writes_into_the_project(self):
         with mock.patch.dict(sw.CFG, {"dumps_dir": "project"}):
             path = sw.make_dump(write_transcript("dddd4444-proj", BASIC))
-        self.assertTrue(path.startswith(os.path.join(PROJECT, ".claude", "session-dumps")))
+        self.assertTrue(path.startswith(os.path.join(os.path.realpath(PROJECT), ".claude", "session-dumps")))
         shutil.rmtree(os.path.join(PROJECT, ".claude"))
 
 

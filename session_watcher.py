@@ -478,10 +478,11 @@ def project_root(cwd):
         out = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=cwd,
                              capture_output=True, timeout=10, **UTF8)
         if out.returncode == 0 and out.stdout.strip():
-            return os.path.normpath(out.stdout.strip())
+            return os.path.realpath(out.stdout.strip())
     except (OSError, subprocess.SubprocessError):
         pass
-    return os.path.normpath(cwd)
+    # the transcript may name the project through a symlink (macOS /var -> /private/var)
+    return os.path.realpath(cwd)
 
 
 def dumps_dir_for(root):
@@ -515,7 +516,7 @@ def exclude_from_git(root, dumps):
 
 
 def project_allowed(root):
-    norm = lambda p: os.path.normcase(os.path.normpath(os.path.expanduser(p)))
+    norm = lambda p: os.path.normcase(os.path.realpath(os.path.expanduser(p)))
     allow = [norm(p) for p in CFG["projects"]]
     r = norm(root or "")
     return not allow or any(r == p or r.startswith(p + os.sep) for p in allow)
