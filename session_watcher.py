@@ -10,25 +10,27 @@ follows the session transcript (~/.claude/projects/<slug>/<session>.jsonl):
 - the transcript has not changed for `idle_minutes` -- the transcript is shrunk
   into a digest locally (no LLM), the digest goes through a single `claude -p`
   call on a cheap model with no tools, no MCP, no settings and a short system
-  prompt; the result is written to <dumps>/<project>/<date>_<sid8>.md and
-  listed in INDEX.md next to it;
+  prompt; the result is a tagged dump <dumps>/<project>/<date>_<sid8>.md with
+  status `new`, listed in INDEX.md next to it;
 - the session continues after a dump -- the next idle period refreshes it;
 - idle for longer than `give_up_hours` -- the watcher exits.
 
-On a new session in the same project the hook can announce the latest dump to
-the model in one line (`announce`), so the next session knows where to look.
+A dump never enters a session by itself: `load` (the /dump-load command) does
+it on request and marks the dump `used`; `clean` deletes used dumps.
 
 Subcommands:
   hook                              SessionStart hook (reads the hook JSON on stdin)
   watch --session ID --transcript PATH [--claude BIN]
+  list [all]                        dumps of the current project (or of all projects)
+  load REF                          print a dump by tag or session id, mark it used
+  clean [all]                       delete used dumps
   dump --transcript PATH [--dry-run]    dump now (--dry-run prints the digest only)
   digest --transcript PATH          print the digest
-  status                            list watched sessions
+  status                            watched sessions
 """
 
 import argparse
 import datetime as dt
-import fcntl
 import glob
 import json
 import os
@@ -38,6 +40,7 @@ import subprocess
 import sys
 import time
 
+WINDOWS = os.name == "nt"
 CLAUDE_DIR = os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude"))
 HOME = os.environ.get("SESSION_WATCHER_HOME") or os.path.join(CLAUDE_DIR, "session-watcher")
 STATE_DIR = os.path.join(HOME, "state")
@@ -46,14 +49,13 @@ CONFIG_FILE = os.path.join(HOME, "config.json")
 # cwd of `claude -p`: outside any project, so no CLAUDE.md or project hooks load
 RUN_DIR = os.path.join(HOME, "run")
 CHILD_ENV = "SESSION_WATCHER_CHILD"
+UTF8 = {"encoding": "utf-8", "errors": "replace"}
 
 DEFAULTS = {
     "idle_minutes": 50,
     "model": "haiku",
     "exclude_commands": [],
     "dumps_dir": os.path.join(CLAUDE_DIR, "session-dumps"),
-    "announce": True,
-    "announce_days": 7,
     "language": "auto",
     "max_words": 350,
     "max_digest_chars": 18000,
@@ -100,9 +102,10 @@ SYSTEM_PROMPT = (
 )
 
 USER_PROMPT = """Below is a digest of a session transcript (user turns `U:`, assistant replies `A:`, actions `T:`).
-Write the dump strictly in the format below, at most {words} words, no preamble. Keep the `Title:` label and the `##` headings exactly as given, in English. {language}
+Write the dump strictly in the format below, at most {words} words, no preamble. Keep the `Title:` and `Tag:` labels and the `##` headings exactly as given, in English. {language}
 
 Title: <up to 10 words>
+Tag: <2-4 lowercase latin words joined by hyphens, naming the work, e.g. fix-csv-parser>
 
 ## Goal
 <1-2 sentences: what the user wanted>
@@ -130,9 +133,113 @@ def log(msg):
     try:
         os.makedirs(HOME, exist_ok=True)
         with open(LOG, "a", encoding="utf-8") as f:
-            f.write("%s [%d] %s\n" % (dt.datetime.now().strftime("%F %T"), os.getpid(), msg))
+            f.write("%s [%d] %s\n" % (dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), os.getpid(), msg))
     except OSError:
         pass
+
+
+# ---------- platform ----------
+
+def try_lock(f):
+    """Non-blocking exclusive lock held for the life of the file object."""
+    try:
+        if WINDOWS:
+            import msvcrt
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+def pid_alive(pid):
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if WINDOWS:  # os.kill(pid, 0) would terminate the process on Windows
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        code = ctypes.c_ulong()
+        k32.GetExitCodeProcess(h, ctypes.byref(code))
+        k32.CloseHandle(h)
+        return code.value == 259  # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def spawn(args):
+    """Start the watcher detached from Claude Code, so it outlives the session process."""
+    os.makedirs(HOME, exist_ok=True)
+    with open(LOG, "a", encoding="utf-8") as out:
+        kw = dict(stdin=subprocess.DEVNULL, stdout=out, stderr=out, close_fds=True, cwd=HOME)
+        if not WINDOWS:
+            return subprocess.Popen(args, start_new_session=True, **kw)
+        flags = 0x00000200 | 0x08000000  # CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+        try:  # leave Claude Code's job object, or the watcher dies with the session
+            return subprocess.Popen(args, creationflags=flags | 0x01000000, **kw)  # CREATE_BREAKAWAY_FROM_JOB
+        except OSError:
+            return subprocess.Popen(args, creationflags=flags, **kw)
+
+
+def parent_of(pid):
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            return int(f.read().rsplit(")", 1)[1].split()[1])
+    except OSError:
+        out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True)
+        return int(out.stdout.strip() or 0)
+
+
+def exe_of(pid):
+    try:
+        return os.readlink("/proc/%d/exe" % pid)
+    except OSError:
+        out = subprocess.run(["ps", "-o", "comm=", "-p", str(pid)], capture_output=True, text=True)
+        return out.stdout.strip()
+
+
+def claude_ancestor():
+    """Path of the claude binary that runs this hook, if it is an ancestor."""
+    if WINDOWS:
+        return None  # CLAUDE_CODE_EXECPATH and PATH cover it
+    pid = os.getppid()
+    try:
+        for _ in range(8):
+            if pid <= 1:
+                return None
+            exe = exe_of(pid)
+            if os.path.basename(exe) == "claude" and os.path.isfile(exe):
+                return exe
+            pid = parent_of(pid)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return None
+
+
+def find_claude(hint=None):
+    names = ("claude.exe", "claude.cmd", "claude") if WINDOWS else ("claude",)
+    cands = [hint, CFG["claude_bin"], os.environ.get("CLAUDE_CODE_EXECPATH"), shutil.which("claude")]
+    for d in (os.path.join(CLAUDE_DIR, "local"), os.path.expanduser("~/.local/bin"),
+              "/usr/local/bin", "/opt/homebrew/bin"):
+        cands += [os.path.join(d, n) for n in names]
+    ext = []
+    for d in ("~/.vscode", "~/.vscode-server", "~/.vscode-insiders", "~/.cursor",
+              "~/.cursor-server", "~/.windsurf", "~/.windsurf-server"):
+        for n in names:
+            ext += glob.glob(os.path.expanduser(
+                d + "/extensions/anthropic.claude-code-*/resources/native-binary/" + n))
+    ext.sort(key=lambda p: [int(x) if x.isdigit() else x for x in re.split(r"[.-]", p)], reverse=True)
+    return next((c for c in cands + ext if c and os.path.isfile(c) and os.access(c, os.X_OK)), None)
 
 
 # ---------- transcript ----------
@@ -146,7 +253,7 @@ def iter_records(path, offset=0):
                 break
             offset += len(raw)
             try:
-                yield json.loads(raw), offset
+                yield json.loads(raw.decode("utf-8", "replace")), offset
             except ValueError:
                 yield None, offset
 
@@ -216,8 +323,11 @@ def short(s, n):
 
 
 def rel(path, cwd):
-    if cwd and isinstance(path, str) and path.startswith(cwd.rstrip("/") + "/"):
-        return path[len(cwd.rstrip("/")) + 1:]
+    if not cwd or not isinstance(path, str) or not path:
+        return path
+    p, c = os.path.normcase(os.path.normpath(path)), os.path.normcase(os.path.normpath(cwd))
+    if p.startswith(c + os.sep):
+        return os.path.normpath(path)[len(c) + 1:].replace(os.sep, "/")
     return path
 
 
@@ -231,10 +341,10 @@ def tool_line(name, inp, cwd, changed):
         return ("read", rel(inp.get("file_path", ""), cwd))
     if name in ("Grep", "Glob"):
         return ("tool", "%s %s" % (name.lower(), short(inp.get("pattern", ""), 80)))
-    if name == "Bash":
+    if name in ("Bash", "PowerShell"):
         cmd = inp.get("command", "")
         tag = " [commit]" if re.search(r"\bgit\s+commit\b", cmd) else ""
-        return ("tool", "bash: %s%s" % (short(inp.get("description") or cmd, 140), tag))
+        return ("tool", "%s: %s%s" % (name.lower(), short(inp.get("description") or cmd, 140), tag))
     if name in ("Agent", "Task"):
         return ("tool", "agent: " + short(inp.get("description") or inp.get("prompt", ""), 120))
     if name == "Skill":
@@ -252,7 +362,8 @@ def tool_line(name, inp, cwd, changed):
 
 
 def parse(path):
-    meta = {"cwd": None, "branch": None, "first": None, "last": None, "prompts": 0, "entrypoint": None}
+    meta = {"cwd": None, "branch": None, "first": None, "last": None, "prompts": 0,
+            "entrypoint": None, "resume_tokens": 0, "model": None}
     events, changed, todos, compact = [], [], None, None
     for rec, _ in iter_records(path):
         if not rec or rec.get("isSidechain"):
@@ -277,7 +388,14 @@ def parse(path):
                 events.append(("user", text))
             continue
         if rec.get("type") == "assistant":
-            for b in (rec.get("message") or {}).get("content") or []:
+            msg = rec.get("message") or {}
+            u = msg.get("usage")
+            if isinstance(u, dict):
+                # the prompt of the last request plus its answer: what a resume re-sends
+                meta["resume_tokens"] = sum(int(u.get(k) or 0) for k in (
+                    "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens"))
+                meta["model"] = msg.get("model") or meta["model"]
+            for b in msg.get("content") or []:
                 if not isinstance(b, dict):
                     continue
                 if b.get("type") == "text" and b.get("text", "").strip():
@@ -351,19 +469,19 @@ def build_digest(path, limit=None):
     return meta, digest, list(dict.fromkeys(changed))
 
 
-# ---------- projects and dumps ----------
+# ---------- projects ----------
 
 def project_root(cwd):
     if not cwd:
         return None
     try:
         out = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=cwd,
-                             capture_output=True, text=True, timeout=10)
+                             capture_output=True, timeout=10, **UTF8)
         if out.returncode == 0 and out.stdout.strip():
-            return out.stdout.strip()
+            return os.path.normpath(out.stdout.strip())
     except (OSError, subprocess.SubprocessError):
         pass
-    return cwd
+    return os.path.normpath(cwd)
 
 
 def dumps_dir_for(root):
@@ -372,6 +490,12 @@ def dumps_dir_for(root):
         return os.path.join(root, ".claude", "session-dumps")
     slug = re.sub(r"[^A-Za-z0-9]", "-", root or "unknown")
     return os.path.join(os.path.expanduser(CFG["dumps_dir"]), slug)
+
+
+def all_dumps_dirs():
+    if CFG["dumps_dir"] == "project":
+        return []
+    return [d for d in glob.glob(os.path.join(os.path.expanduser(CFG["dumps_dir"]), "*")) if os.path.isdir(d)]
 
 
 def exclude_from_git(root, dumps):
@@ -391,21 +515,96 @@ def exclude_from_git(root, dumps):
 
 
 def project_allowed(root):
-    allow = [os.path.expanduser(p).rstrip("/") for p in CFG["projects"]]
-    return not allow or any(root == p or (root or "").startswith(p + "/") for p in allow)
+    norm = lambda p: os.path.normcase(os.path.normpath(os.path.expanduser(p)))
+    allow = [norm(p) for p in CFG["projects"]]
+    r = norm(root or "")
+    return not allow or any(r == p or r.startswith(p + os.sep) for p in allow)
 
 
-def find_claude(hint=None):
-    cands = [hint, CFG["claude_bin"], shutil.which("claude"),
-             os.path.join(CLAUDE_DIR, "local", "claude"),
-             os.path.expanduser("~/.local/bin/claude"),
-             "/usr/local/bin/claude", "/opt/homebrew/bin/claude"]
-    ext = []
-    for d in ("~/.vscode", "~/.vscode-server", "~/.vscode-insiders", "~/.cursor",
-              "~/.cursor-server", "~/.windsurf", "~/.windsurf-server"):
-        ext += glob.glob(os.path.expanduser(d + "/extensions/anthropic.claude-code-*/resources/native-binary/claude"))
-    ext.sort(key=lambda p: [int(x) if x.isdigit() else x for x in re.split(r"[.-]", p)], reverse=True)
-    return next((c for c in cands + ext if c and os.path.isfile(c) and os.access(c, os.X_OK)), None)
+# ---------- dump files ----------
+
+FIELDS = ("tag", "status", "session", "project", "branch", "session_start", "session_end",
+          "user_turns", "resume_tokens", "dump_tokens", "model", "dumped", "used_at", "used_in")
+
+
+def read_dump(path):
+    """(meta, body) of a dump file; meta comes from the front matter."""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        text = f.read()
+    meta = {}
+    if text.startswith("---\n"):
+        end = text.find("\n---\n", 4)
+        if end > 0:
+            for line in text[4:end].splitlines():
+                k, _, v = line.partition(":")
+                meta[k.strip()] = v.strip()
+            text = text[end + 5:]
+    return meta, text.lstrip("\n")
+
+
+def write_dump(path, meta, body):
+    fm = "\n".join("%s: %s" % (k, meta.get(k, "")) for k in FIELDS)
+    with open(path + ".tmp", "w", encoding="utf-8", newline="\n") as f:
+        f.write("---\n%s\n---\n\n%s" % (fm, body))
+    os.replace(path + ".tmp", path)
+
+
+def dump_files(dirs):
+    out = []
+    for d in dirs:
+        out += glob.glob(os.path.join(d, "*_*.md"))
+    return out
+
+
+def title_of(body):
+    first = body.lstrip().split("\n", 1)[0]
+    return first.lstrip("# ").strip() or "untitled"
+
+
+def slug(text):
+    s = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return "-".join(s.split("-")[:5])[:40].strip("-")
+
+
+def unique_tag(tag, dumps, sid):
+    taken = set()
+    for p in dump_files([dumps]):
+        m, _ = read_dump(p)
+        if m.get("session") != sid:
+            taken.add(m.get("tag"))
+    base, n = tag, 2
+    while tag in taken:
+        tag, n = "%s-%d" % (base, n), n + 1
+    return tag
+
+
+def split_answer(body):
+    """(title, tag, rest) from the model answer: `Title:` and `Tag:` lines first."""
+    title, tag, lines = None, None, body.strip().split("\n")
+    while lines and (title is None or tag is None):
+        line = lines[0].strip()
+        if not line:
+            lines.pop(0)
+            continue
+        m = re.match(r"\W*tag\W*:\s*(.+)", line, re.I)
+        if m and tag is None:
+            tag = slug(m.group(1))
+            lines.pop(0)
+            continue
+        if line.startswith("##") or title is not None:
+            break
+        m = re.match(r"(?:#\s*)?(?:\**[^\s:*]{1,12}\**\s*:\s*)?(.+)", line)
+        title = short(m.group(1).strip("*_ "), 90)
+        lines.pop(0)
+    return title, tag, "\n".join(lines).strip()
+
+
+def tokens_k(n):
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return "?"
+    return "%.1fk" % (n / 1000.0) if n < 10000 else "%dk" % round(n / 1000.0)
 
 
 def call_llm(digest, claude_bin):
@@ -425,8 +624,8 @@ def call_llm(digest, claude_bin):
     err = ""
     for cmd in attempts:
         try:
-            r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=RUN_DIR,
-                               env=env, timeout=CFG["llm_timeout_seconds"])
+            r = subprocess.run(cmd, input=prompt, capture_output=True, cwd=RUN_DIR,
+                               env=env, timeout=CFG["llm_timeout_seconds"], **UTF8)
         except Exception as e:
             return None, "failed to run claude: %s" % e
         try:
@@ -451,7 +650,7 @@ def git_state(cwd):
         return ""
     try:
         out = subprocess.run(["git", "status", "--short", "--branch"], cwd=cwd,
-                             capture_output=True, text=True, timeout=20)
+                             capture_output=True, timeout=20, **UTF8)
     except (OSError, subprocess.SubprocessError):
         return ""
     lines = out.stdout.splitlines() if out.returncode == 0 else []
@@ -467,10 +666,13 @@ def local_time(ts):
         return ts or "?"
 
 
+def now():
+    return dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
 def find_dump(sid, dumps=None):
     pattern = "*_%s.md" % sid[:8]
-    dirs = [dumps] if dumps else glob.glob(os.path.join(os.path.expanduser(CFG["dumps_dir"]), "*"))
-    for d in dirs:
+    for d in [dumps] if dumps else all_dumps_dirs():
         for p in glob.glob(os.path.join(d, pattern)):
             return p
     return None
@@ -485,17 +687,13 @@ def make_dump(transcript, claude_bin=None, dry_run=False):
         log("%s: no user turns, nothing to dump" % sid)
         return None
     root = project_root(meta["cwd"]) or os.path.dirname(transcript)
-    body, info = call_llm(digest, find_claude(claude_bin))
-    title = "untitled"
-    if body:
-        # first line is the title: "Title: x", or a translated label, or "# x"
-        m = re.match(r"\s*(?!##)(?:#\s*)?(?:\**[^\s:*]{1,12}\**\s*:\s*)?(.+)", body)
-        if m and not m.group(1).startswith("#"):
-            title = short(m.group(1).strip("*_ "), 90)
-            body = body[m.end():].strip()
+    answer, info = call_llm(digest, find_claude(claude_bin))
+    if answer:
+        title, tag, body = split_answer(answer)
         log("%s: dump via %s, %s" % (sid, CFG["model"], info))
     else:
         log("%s: LLM unavailable (%s), saving the raw digest" % (sid, info))
+        title, tag = None, None
         body = "> LLM unavailable (%s). Raw transcript digest below.\n\n```\n%s\n```" % (
             info, short(digest, 8000))
     dumps = dumps_dir_for(root)
@@ -504,24 +702,18 @@ def make_dump(transcript, claude_bin=None, dry_run=False):
         exclude_from_git(root, dumps)
     stamp = local_time(meta["first"]).replace(" ", "_").replace(":", "")
     path = find_dump(sid, dumps) or os.path.join(dumps, "%s_%s.md" % (stamp, sid[:8]))
-    idle = int((time.time() - os.path.getmtime(transcript)) // 60)
-    header = "\n".join([
-        "# %s" % title,
-        "",
-        "- Session: `%s` (resume: `claude --resume %s`)" % (sid, sid),
-        "- Project: `%s`, branch: `%s`, cwd: `%s`" % (root, meta["branch"], meta["cwd"]),
-        "- Period: %s to %s, user turns: %d" % (local_time(meta["first"]), local_time(meta["last"]), meta["prompts"]),
-        "- Transcript: `%s`" % transcript,
-        "- Dumped: %s after %d min idle" % (dt.datetime.now().strftime("%Y-%m-%d %H:%M"), idle),
-        "", "",
-    ])
-    tail = ""
+    old = read_dump(path)[0] if os.path.exists(path) else {}
+    tag = old.get("tag") or unique_tag(tag or slug(title or "") or "session-" + sid[:8], dumps, sid)
+    text = "# %s\n\nResume the original session: `claude --resume %s`\n\n%s" % (title or "untitled", sid, body)
     state = git_state(meta["cwd"])
     if state:
-        tail = "\n\n## Working tree at dump time\n\n```\n%s\n```\n" % state
-    with open(path + ".tmp", "w", encoding="utf-8") as f:
-        f.write(header + body + tail)
-    os.replace(path + ".tmp", path)
+        text += "\n\n## Working tree at dump time\n\n```\n%s\n```\n" % state
+    write_dump(path, {
+        "tag": tag, "status": "new", "session": sid, "project": root, "branch": meta["branch"] or "",
+        "session_start": local_time(meta["first"]), "session_end": local_time(meta["last"]),
+        "user_turns": meta["prompts"], "resume_tokens": meta["resume_tokens"],
+        "dump_tokens": len(text) // 3, "model": meta["model"] or "", "dumped": now(),
+    }, text)
     write_index(dumps)
     return path
 
@@ -529,39 +721,123 @@ def make_dump(transcript, claude_bin=None, dry_run=False):
 def write_index(dumps):
     cutoff = time.time() - CFG["keep_days"] * 86400
     rows = []
-    for p in glob.glob(os.path.join(dumps, "*_*.md")):
+    for p in dump_files([dumps]):
         if os.path.getmtime(p) < cutoff:
             os.remove(p)
             continue
-        with open(p, encoding="utf-8") as f:
-            lines = f.read(2000).splitlines()
-        title = lines[0].lstrip("# ").strip() if lines else "?"
-        branch = next((m.group(1) for m in (re.search(r"branch: `([^`]*)`", l) for l in lines) if m), "?")
-        period = next((l.split("Period:")[1].split(",")[0].strip() for l in lines if "Period:" in l), "")
-        rows.append((os.path.getmtime(p), "- %s · `%s` · %s → [%s](%s)" % (
-            period, branch, title, os.path.basename(p), os.path.basename(p))))
+        m, body = read_dump(p)
+        rows.append((m.get("session_start", ""), "- `%s` · %s · %s · %s → [%s](%s)" % (
+            m.get("tag", "?"), m.get("status", "?"), m.get("session_start", "?"), title_of(body),
+            os.path.basename(p), os.path.basename(p))))
     rows.sort(reverse=True)
-    text = ("# Dumps of unclosed sessions\n\n"
-            "Written by session-watcher after %d min of inactivity. Newest first. "
-            "Read on demand, not by default.\n\n" % CFG["idle_minutes"]
-            + "\n".join(r for _, r in rows) + "\n")
-    with open(os.path.join(dumps, "INDEX.md"), "w", encoding="utf-8") as f:
-        f.write(text)
+    with open(os.path.join(dumps, "INDEX.md"), "w", encoding="utf-8", newline="\n") as f:
+        f.write("# Session dumps\n\nWritten by session-watcher after %d min of inactivity. "
+                "Newest first. Load one with /dump-load <tag>.\n\n" % CFG["idle_minutes"]
+                + "\n".join(r for _, r in rows) + "\n")
 
 
-def drop_dump(sid):
+def transcript_cwd(path):
+    for rec, _ in iter_records(path):
+        if rec and rec.get("cwd"):
+            return rec["cwd"]
+    return None
+
+
+def drop_dump(sid, transcript=None):
     p = find_dump(sid)
+    if not p and transcript:  # `project` mode: the dumps live in the session's project
+        cwd = transcript_cwd(transcript)
+        p = find_dump(sid, dumps_dir_for(project_root(cwd))) if cwd else None
     if p:
         os.remove(p)
         write_index(os.path.dirname(p))
         log("%s: dump removed, the session ran an excluded command" % sid)
 
 
+# ---------- list / load / clean ----------
+
+def scope_dirs(all_projects):
+    if all_projects:
+        return all_dumps_dirs()
+    return [dumps_dir_for(project_root(os.getcwd()))]
+
+
+def collect(all_projects):
+    items = []
+    for p in dump_files(scope_dirs(all_projects)):
+        m, body = read_dump(p)
+        items.append((p, m, body))
+    items.sort(key=lambda x: x[1].get("session_start", ""), reverse=True)
+    return items
+
+
+def cmd_list(all_projects):
+    items = collect(all_projects)
+    if not items:
+        return "No session dumps %s." % ("at all" if all_projects else "for this project (try: all)")
+    head = ["tag", "status", "session date", "session id", "resume prefix", "dump", "title"]
+    if all_projects:
+        head.insert(1, "project")
+    rows = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+    for p, m, body in items:
+        cells = ["`%s`" % m.get("tag", "?"), m.get("status", "?"), m.get("session_start", "?"),
+                 "`%s`" % m.get("session", "?"), tokens_k(m.get("resume_tokens")) + " tok",
+                 tokens_k(m.get("dump_tokens")) + " tok", title_of(body).replace("|", "/")]
+        if all_projects:
+            cells.insert(1, os.path.basename(m.get("project", "")) or "?")
+        rows.append("| " + " | ".join(cells) + " |")
+    return ("\n".join(rows) + "\n\nresume prefix: tokens a `claude --resume` of that session would "
+            "process again once its prompt cache has expired; dump: approximate size of the dump.")
+
+
+def match(items, ref):
+    ref = ref.strip().strip("`\"'")
+    exact = [i for i in items if i[1].get("tag") == ref or i[1].get("session") == ref]
+    if exact or len(ref) < 4:
+        return exact
+    return [i for i in items if i[1].get("session", "").startswith(ref) or i[1].get("tag", "").startswith(ref)]
+
+
+def cmd_load(ref):
+    if not ref.strip():
+        return False, "Name a dump: /dump-load <tag | session id>.\n\n" + cmd_list(False)
+    found = match(collect(False), ref) or match(collect(True), ref)
+    if not found:
+        return False, "No dump matches `%s`.\n\n%s" % (ref, cmd_list(False))
+    if len(found) > 1:
+        return False, "`%s` matches several dumps: %s. Name one by its full tag or session id." % (
+            ref, ", ".join("`%s` (%s)" % (m.get("tag"), m.get("session")) for _, m, _ in found))
+    path, meta, body = found[0]
+    was = meta.get("status")
+    meta.update(status="used", used_at=now(), used_in=os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
+    write_dump(path, meta, body)
+    write_index(os.path.dirname(path))
+    note = "" if was != "used" else " It had been loaded before, so it may be stale."
+    return True, ("Context dump `%s` of session %s (%s to %s, project %s, branch %s), "
+                  "now marked as used.%s\n\n%s" % (
+                      meta.get("tag"), meta.get("session"), meta.get("session_start"),
+                      meta.get("session_end"), meta.get("project"), meta.get("branch"), note, body))
+
+
+def cmd_clean(all_projects):
+    removed, dirs = [], set()
+    for p, m, _ in collect(all_projects):
+        if m.get("status") == "used":
+            os.remove(p)
+            removed.append(m.get("tag", os.path.basename(p)))
+            dirs.add(os.path.dirname(p))
+    for d in dirs:
+        write_index(d)
+    if not removed:
+        return "No used dumps to delete."
+    return "Deleted %d used dump(s): %s." % (len(removed), ", ".join("`%s`" % t for t in removed))
+
+
 # ---------- watcher ----------
 
 def load_state(sid):
     try:
-        with open(os.path.join(STATE_DIR, sid + ".json")) as f:
+        with open(os.path.join(STATE_DIR, sid + ".json"), encoding="utf-8") as f:
             return json.load(f)
     except (OSError, ValueError):
         return {}
@@ -570,17 +846,15 @@ def load_state(sid):
 def save_state(sid, st):
     os.makedirs(STATE_DIR, exist_ok=True)
     p = os.path.join(STATE_DIR, sid + ".json")
-    with open(p + ".tmp", "w") as f:
+    with open(p + ".tmp", "w", encoding="utf-8") as f:
         json.dump(st, f)
     os.replace(p + ".tmp", p)
 
 
 def watch(sid, transcript, claude_bin):
     os.makedirs(STATE_DIR, exist_ok=True)
-    with open(os.path.join(STATE_DIR, sid + ".lock"), "w") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+    with open(os.path.join(STATE_DIR, sid + ".lock"), "a") as lock:
+        if not try_lock(lock):
             return  # another watcher has this session
         _watch(sid, transcript, claude_bin)
 
@@ -617,7 +891,7 @@ def _watch(sid, transcript, claude_bin):
                 st["excluded"] = marker
                 save_state(sid, st)
                 log("%s: %s, watching stopped" % (sid, marker))
-                drop_dump(sid)
+                drop_dump(sid, transcript)
                 return
         save_state(sid, st)
         mtime = os.path.getmtime(transcript)
@@ -639,70 +913,16 @@ def _watch(sid, transcript, claude_bin):
 
 # ---------- hook ----------
 
-def parent_of(pid):
-    try:
-        with open("/proc/%d/stat" % pid) as f:
-            return int(f.read().rsplit(")", 1)[1].split()[1])
-    except OSError:
-        out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True)
-        return int(out.stdout.strip() or 0)
-
-
-def exe_of(pid):
-    try:
-        return os.readlink("/proc/%d/exe" % pid)
-    except OSError:
-        out = subprocess.run(["ps", "-o", "comm=", "-p", str(pid)], capture_output=True, text=True)
-        return out.stdout.strip()
-
-
-def claude_ancestor():
-    """Path of the claude binary that runs this hook, if it is an ancestor."""
-    pid = os.getppid()
-    try:
-        for _ in range(8):
-            if pid <= 1:
-                return None
-            exe = exe_of(pid)
-            if os.path.basename(exe) == "claude" and os.path.isfile(exe):
-                return exe
-            pid = parent_of(pid)
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return None
-    return None
-
-
-def announcement(root, sid):
-    """One line about the latest dump of this project, for the model's context."""
-    if not CFG["announce"] or not root:
-        return None
-    dumps = dumps_dir_for(root)
-    cutoff = time.time() - CFG["announce_days"] * 86400
-    files = [p for p in glob.glob(os.path.join(dumps, "*_*.md"))
-             if os.path.getmtime(p) >= cutoff and not p.endswith("_%s.md" % sid[:8])]
-    if not files:
-        return None
-    latest = max(files, key=os.path.getmtime)
-    with open(latest, encoding="utf-8") as f:
-        title = f.readline().lstrip("# ").strip()
-    return ("session-watcher: an earlier session in this project ended without a closing ritual; "
-            "its context dump \"%s\" is at %s (all dumps: %s). Read it only if the user asks "
-            "to continue earlier work." % (title, latest, os.path.join(dumps, "INDEX.md")))
-
-
-def spawn(args):
-    """Start the watcher detached from Claude Code, so it outlives the session process."""
-    os.makedirs(HOME, exist_ok=True)
-    out = open(LOG, "a")
-    subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=out, stderr=out,
-                     start_new_session=True, close_fds=True, cwd=HOME)
+def read_stdin():
+    stream = getattr(sys.stdin, "buffer", None)
+    return stream.read().decode("utf-8", "replace") if stream else sys.stdin.read()
 
 
 def hook():
     if os.environ.get(CHILD_ENV):
         return
     try:
-        payload = json.load(sys.stdin)
+        payload = json.loads(read_stdin())
     except ValueError:
         return
     sid, transcript = payload.get("session_id"), payload.get("transcript_path")
@@ -712,23 +932,10 @@ def hook():
     if root and not project_allowed(root):
         return
     args = [sys.executable, os.path.abspath(__file__), "watch", "--session", sid, "--transcript", transcript]
-    exe = claude_ancestor()
+    exe = claude_ancestor() or os.environ.get("CLAUDE_CODE_EXECPATH")
     if exe:
         args += ["--claude", exe]
     spawn(args)
-    if payload.get("source") in (None, "startup", "clear"):
-        note = announcement(root, sid)
-        if note:
-            print(json.dumps({"hookSpecificOutput": {
-                "hookEventName": "SessionStart", "additionalContext": note}}))
-
-
-def alive(pid):
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except (OSError, ValueError, TypeError):
-        return False
 
 
 def status():
@@ -736,21 +943,29 @@ def status():
     for p in sorted(glob.glob(os.path.join(STATE_DIR, "*.json")), key=os.path.getmtime, reverse=True):
         st = load_state(os.path.basename(p)[:-5])
         state = ("excluded: " + st["excluded"]) if st.get("excluded") else (
-            "watching" if alive(st.get("pid")) else "stopped")
-        dumped = "dumped" if st.get("dumped_mtime") else ""
-        rows.append("%s  %-30s %s" % (os.path.basename(p)[:-5], state, dumped))
-    print("\n".join(rows) or "no sessions watched yet")
+            "watching" if pid_alive(st.get("pid")) else "stopped")
+        rows.append("%s  %-30s %s" % (os.path.basename(p)[:-5], state, "dumped" if st.get("dumped_mtime") else ""))
+    return "\n".join(rows) or "no sessions watched yet"
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):  # Windows consoles default to a legacy code page
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     ap = argparse.ArgumentParser(description="Session watcher for Claude Code")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub = ap.add_subparsers(dest="cmd")
+    sub.required = True
     sub.add_parser("hook")
     sub.add_parser("status")
     w = sub.add_parser("watch")
     w.add_argument("--session", required=True)
     w.add_argument("--transcript", required=True)
     w.add_argument("--claude")
+    for name in ("list", "clean"):
+        sub.add_parser(name).add_argument("scope", nargs="*")
+    sub.add_parser("load").add_argument("ref", nargs="*")
     d = sub.add_parser("dump")
     d.add_argument("--transcript", required=True)
     d.add_argument("--dry-run", action="store_true")
@@ -765,7 +980,13 @@ def main():
     elif a.cmd == "watch":
         watch(a.session, a.transcript, a.claude)
     elif a.cmd == "status":
-        status()
+        print(status())
+    elif a.cmd == "list":
+        print(cmd_list(any(s.strip("-") == "all" for s in a.scope)))
+    elif a.cmd == "clean":
+        print(cmd_clean(any(s.strip("-") == "all" for s in a.scope)))
+    elif a.cmd == "load":
+        print(cmd_load(" ".join(a.ref))[1])
     elif a.cmd == "dump":
         res = make_dump(a.transcript, dry_run=a.dry_run)
         print(res if res else "no dump written (see %s)" % LOG)

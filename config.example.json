@@ -3,8 +3,6 @@
   "model": "haiku",
   "exclude_commands": [],
   "dumps_dir": "~/.claude/session-dumps",
-  "announce": true,
-  "announce_days": 7,
   "language": "auto",
   "max_words": 350,
   "max_digest_chars": 18000,
